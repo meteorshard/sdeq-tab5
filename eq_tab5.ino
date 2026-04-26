@@ -56,6 +56,7 @@ AppState      g_state          = STATE_IDLE;
 float         g_data[MAX_POINTS];
 int           g_data_count     = 0;
 unsigned long g_last_push_ms   = 0;
+float         g_live_hpa       = 0.0f;  // 渲染用缓存值，与传感器读取解耦
 
 // 校准相关
 float         g_offset         = 0.0f;
@@ -242,6 +243,8 @@ void setup() {
     auto cfg = M5.config();
     M5.begin(cfg);
 
+    M5.Display.setRotation(1);  // 横屏：默认竖屏(720×1280)，旋转后变(1280×720)
+
     Wire.begin(I2C_SDA, I2C_SCL, I2C_FREQ);
 
     M5.Display.fillScreen(COLOR_BG);
@@ -296,23 +299,24 @@ void loop() {
 
     // ── 记录阶段 ──
     if (g_state == STATE_RUNNING) {
-        float raw = readPressureHpa();
+        unsigned long now = millis();
 
-        if (!isnan(raw)) {
-            float hpa = raw - g_offset;
-
-            unsigned long now = millis();
-            if (now - g_last_push_ms >= DATA_INTERVAL_MS) {
+        // 传感器只在需要推入新数据点时才读（避免 30ms 阻塞拖慢渲染）
+        if (now - g_last_push_ms >= DATA_INTERVAL_MS) {
+            float raw = readPressureHpa();
+            if (!isnan(raw)) {
+                g_live_hpa     = raw - g_offset;
                 g_last_push_ms = now;
                 if (g_data_count < MAX_POINTS) {
-                    g_data[g_data_count++] = hpa;
+                    g_data[g_data_count++] = g_live_hpa;
                 } else {
                     memmove(g_data, g_data + 1, (MAX_POINTS - 1) * sizeof(float));
-                    g_data[MAX_POINTS - 1] = hpa;
+                    g_data[MAX_POINTS - 1] = g_live_hpa;
                 }
             }
-
-            pushFrame(hpa, 0);
         }
+
+        // 渲染每次 loop 都跑，用缓存值画图，不再被传感器阻塞
+        pushFrame(g_live_hpa, 0);
     }
 }
