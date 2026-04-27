@@ -59,12 +59,16 @@ constexpr float X_STEP = (float)CHART_W / (MAX_POINTS - 1);
 #define SENSOR_CONV_MS    32
 // 校准持续时间
 #define CALIB_DURATION_MS 3000
+// UI 刷新节流：仅在有变化时按该上限刷新
+#define RUNNING_FRAME_MS  16
+#define CALIB_FRAME_MS    33
 
 // ── 状态机 ────────────────────────────────────────────────
 enum AppState { STATE_IDLE, STATE_CALIBRATING, STATE_RUNNING, STATE_STOPPED };
 
 AppState      g_state          = STATE_IDLE;
 float         g_data[MAX_POINTS];
+int           g_data_head      = 0;
 int           g_data_count     = 0;
 float         g_live_hpa       = 0.0f;
 
@@ -81,6 +85,8 @@ unsigned long g_sensor_trigger_ms  = 0;
 // 帧率统计
 uint32_t      g_frame_count    = 0;
 unsigned long g_fps_last_ms    = 0;
+unsigned long g_last_frame_ms  = 0;
+bool          g_frame_dirty    = true;
 
 // ── 双 Canvas ping-pong（物理 720×1280，逻辑旋转为 1280×720）──
 // 必须传入 &M5.Display 作为 parent，createSprite 才能从 PSRAM 分配 1.84MB 缓冲
@@ -99,6 +105,44 @@ static void taskPush(void*) {
         xSemaphoreGive(g_sem_push_done);
         vTaskDelay(1);  // 让出 1ms，避免 IDLE0 饥饿触发 task watchdog
     }
+}
+
+static inline int dataIndex(int logical_index) {
+    return (g_data_head + logical_index) % MAX_POINTS;
+}
+
+static float dataAt(int logical_index) {
+    return g_data[dataIndex(logical_index)];
+}
+
+static void appendData(float value) {
+    if (g_data_count < MAX_POINTS) {
+        g_data[dataIndex(g_data_count)] = value;
+        g_data_count++;
+        return;
+    }
+
+    g_data[g_data_head] = value;
+    g_data_head = (g_data_head + 1) % MAX_POINTS;
+}
+
+static void resetData() {
+    g_data_head = 0;
+    g_data_count = 0;
+}
+
+static void markFrameDirty() {
+    g_frame_dirty = true;
+}
+
+static bool shouldRender(uint32_t now_ms, uint32_t interval_ms) {
+    return g_frame_dirty && now_ms - g_last_frame_ms >= interval_ms;
+}
+
+static void resetMeasurement() {
+    resetData();
+    g_live_hpa = 0.0f;
+    g_sensor_converting = false;
 }
 
 // ──────────────────────────────────────────────────────────
@@ -123,27 +167,56 @@ float sensorReadResult() {
     uint8_t b2 = Wire.read();
 
     int32_t adc_val = ((int32_t)b0 << 16) | ((int32_t)b1 << 8) | b2;
-    if (adc_val > 8388608L) adc_val -= 16777216L;
+    if (adc_val >= 0x800000L) adc_val -= 0x1000000L;
 
     float pressure_pa = (adc_val / 2097152.0f) * (P_MAX - P_MIN) + P_MIN;
     return pressure_pa / 100.0f;
 }
 
-// 阻塞式读取（仅用于校准阶段）
-float readPressureHpa() {
-    if (!sensorTrigger()) return NAN;
-    delay(SENSOR_CONV_MS);
-    return sensorReadResult();
+static bool startSensorConversion() {
+    if (!sensorTrigger()) {
+        Serial.println("sensorTrigger failed");
+        return false;
+    }
+    g_sensor_trigger_ms = millis();
+    g_sensor_converting = true;
+    return true;
 }
 
-// ──────────────────────────────────────────────────────────
-// 渲染整帧到后台 canvas（g_canvas[g_back]），不推送到屏幕
-// ──────────────────────────────────────────────────────────
-void pushFrame(int elapsed_ms) {
-    auto& cv = g_canvas[g_back];
-    cv.fillScreen(COLOR_BG);
+static bool readCompletedRawSample(float* raw_out) {
+    if (!g_sensor_converting) return false;
 
-    // ── 顶部状态栏 ──
+    uint32_t now = millis();
+    if (now - g_sensor_trigger_ms < SENSOR_CONV_MS) return false;
+
+    float raw = sensorReadResult();
+    g_sensor_converting = false;
+
+    if (!startSensorConversion()) {
+        markFrameDirty();
+    }
+
+    if (isnan(raw)) return false;
+
+    if (raw_out) {
+        *raw_out = raw;
+    }
+    return true;
+}
+
+static bool consumeSensorSample() {
+    float raw = NAN;
+    if (!readCompletedRawSample(&raw)) return false;
+
+    if (isnan(raw)) return false;
+
+    g_live_hpa = raw - g_offset;
+    appendData(g_live_hpa);
+    markFrameDirty();
+    return true;
+}
+
+static void renderStatusBar(M5Canvas& cv, int elapsed_ms) {
     cv.setTextSize(3);
     cv.setTextColor(COLOR_AXIS, COLOR_BG);
     if (g_state == STATE_IDLE) {
@@ -151,7 +224,9 @@ void pushFrame(int elapsed_ms) {
     } else if (g_state == STATE_STOPPED) {
         cv.drawString("Stopped. Tap anywhere to Start", 10, 20);
     } else if (g_state == STATE_RUNNING) {
-        cv.drawString("Recording...", 10, 20);
+        char buf[64];
+        snprintf(buf, sizeof(buf), "Recording...  %.2f hPa", g_live_hpa);
+        cv.drawString(buf, 10, 20);
     } else if (g_state == STATE_CALIBRATING) {
         int secs_left = (int)((CALIB_DURATION_MS - elapsed_ms + 999) / 1000);
         if (secs_left < 0) secs_left = 0;
@@ -160,79 +235,94 @@ void pushFrame(int elapsed_ms) {
         cv.setTextColor(COLOR_CALIB, COLOR_BG);
         cv.drawString(buf, 10, 20);
     }
+}
 
-    // ── 校准进度条 ──
-    if (g_state == STATE_CALIBRATING) {
-        int bar_w = CHART_W;
-        int bar_x = (SCREEN_W - bar_w) / 2;
-        int bar_y = SCREEN_H / 2 - 10;
-        int bar_h = 20;
-        int filled = (int)((float)elapsed_ms / CALIB_DURATION_MS * bar_w);
-        if (filled > bar_w) filled = bar_w;
-        cv.drawRect(bar_x, bar_y, bar_w, bar_h, COLOR_AXIS);
-        if (filled > 1)
-            cv.fillRect(bar_x + 1, bar_y + 1, filled - 1, bar_h - 2, COLOR_CALIB);
-        return;
+static void renderCalibrationView(M5Canvas& cv, int elapsed_ms) {
+    int bar_w = CHART_W;
+    int bar_x = (SCREEN_W - bar_w) / 2;
+    int bar_y = SCREEN_H / 2 - 10;
+    int bar_h = 20;
+    int filled = (int)((float)elapsed_ms / CALIB_DURATION_MS * bar_w);
+    if (filled > bar_w) filled = bar_w;
+    cv.drawRect(bar_x, bar_y, bar_w, bar_h, COLOR_AXIS);
+    if (filled > 1) {
+        cv.fillRect(bar_x + 1, bar_y + 1, filled - 1, bar_h - 2, COLOR_CALIB);
     }
+}
 
+static void renderChartStatic(M5Canvas& cv) {
     // ── 坐标轴 ──
     cv.drawLine(CHART_X, CHART_Y - CHART_H, CHART_X, CHART_Y, COLOR_AXIS);
     cv.drawLine(CHART_X, CHART_Y, CHART_X + CHART_W, CHART_Y, COLOR_AXIS);
+}
 
+static void renderChartDynamic(M5Canvas& cv) {
     // ── 折线图（仅 RUNNING 且有数据时）──
-    if (g_state == STATE_RUNNING && g_data_count >= 1) {
-        // 计算 Y 轴范围
-        float cur_min = g_data[0], cur_max = g_data[0];
-        for (int i = 1; i < g_data_count; i++) {
-            if (g_data[i] < cur_min) cur_min = g_data[i];
-            if (g_data[i] > cur_max) cur_max = g_data[i];
-        }
+    if (g_state != STATE_RUNNING || g_data_count < 1) return;
 
-        float display_min = (cur_min > 0.0f) ? 0.0f : cur_min;
-        float y_range     = cur_max - display_min;
-        if (y_range < 100.0f) y_range = 100.0f;
-        float display_max = ceilf(display_min + y_range);
-        y_range = display_max - display_min;
+    float cur_min = dataAt(0), cur_max = dataAt(0);
+    for (int i = 1; i < g_data_count; i++) {
+        float value = dataAt(i);
+        if (value < cur_min) cur_min = value;
+        if (value > cur_max) cur_max = value;
+    }
 
-        // 0 基线
-        if (display_min < 0.0f) {
-            int y_zero = (int)(CHART_Y - (0.0f - display_min) / y_range * CHART_H);
-            cv.drawLine(CHART_X, y_zero, CHART_X + CHART_W, y_zero, COLOR_ZERO);
-            cv.setTextSize(2);
-            cv.setTextColor(COLOR_AXIS, COLOR_BG);
-            cv.drawString("0", 2, y_zero - 12);
-        }
+    float display_min = (cur_min > 0.0f) ? 0.0f : cur_min;
+    float y_range     = cur_max - display_min;
+    if (y_range < 100.0f) y_range = 100.0f;
+    float display_max = ceilf(display_min + y_range);
+    y_range = display_max - display_min;
 
-        // 历史折线
-        for (int i = 0; i < g_data_count - 1; i++) {
-            int x1 = (int)(CHART_X + i * X_STEP);
-            int y1 = (int)(CHART_Y - ((g_data[i]     - display_min) / y_range) * CHART_H);
-            int x2 = (int)(CHART_X + (i + 1) * X_STEP);
-            int y2 = (int)(CHART_Y - ((g_data[i + 1] - display_min) / y_range) * CHART_H);
-            cv.drawLine(x1, y1, x2, y2, COLOR_LINE);
-        }
-
-        // 最新值指示点
-        int last_x = (int)(CHART_X + (g_data_count - 1) * X_STEP);
-        int last_y = (int)(CHART_Y - ((g_data[g_data_count - 1] - display_min) / y_range) * CHART_H);
-        cv.fillRect(last_x - 3, last_y - 3, 7, 7, COLOR_CURRENT);
-
-        // Y 轴标注
+    if (display_min < 0.0f) {
+        int y_zero = (int)(CHART_Y - (0.0f - display_min) / y_range * CHART_H);
+        cv.drawLine(CHART_X, y_zero, CHART_X + CHART_W, y_zero, COLOR_ZERO);
         cv.setTextSize(2);
-        char buf[16];
         cv.setTextColor(COLOR_AXIS, COLOR_BG);
-        snprintf(buf, sizeof(buf), "%d", (int)display_max);
-        cv.drawString(buf, 2, CHART_Y - CHART_H);
-        snprintf(buf, sizeof(buf), "%d", (int)floorf(display_min));
-        cv.drawString(buf, 2, CHART_Y - 20);
+        cv.drawString("0", 2, y_zero - 12);
+    }
 
-        // 当前值标签（黄色）
-        int text_y = last_y - 12;
-        if (text_y < CHART_Y - CHART_H) text_y = CHART_Y - CHART_H;
-        if (text_y > CHART_Y - 20)      text_y = CHART_Y - 20;
-        cv.setTextColor(COLOR_CURRENT, COLOR_BG);
-        snprintf(buf, sizeof(buf), "%.2f", g_data[g_data_count - 1]);
-        cv.drawString(buf, 2, text_y);
+    for (int i = 0; i < g_data_count - 1; i++) {
+        int x1 = (int)(CHART_X + i * X_STEP);
+        int y1 = (int)(CHART_Y - ((dataAt(i)     - display_min) / y_range) * CHART_H);
+        int x2 = (int)(CHART_X + (i + 1) * X_STEP);
+        int y2 = (int)(CHART_Y - ((dataAt(i + 1) - display_min) / y_range) * CHART_H);
+        cv.drawLine(x1, y1, x2, y2, COLOR_LINE);
+    }
+
+    int last_x = (int)(CHART_X + (g_data_count - 1) * X_STEP);
+    float last_value = dataAt(g_data_count - 1);
+    int last_y = (int)(CHART_Y - ((last_value - display_min) / y_range) * CHART_H);
+    cv.fillRect(last_x - 3, last_y - 3, 7, 7, COLOR_CURRENT);
+
+    cv.setTextSize(2);
+    char buf[16];
+    cv.setTextColor(COLOR_AXIS, COLOR_BG);
+    snprintf(buf, sizeof(buf), "%d", (int)display_max);
+    cv.drawString(buf, 2, CHART_Y - CHART_H);
+    snprintf(buf, sizeof(buf), "%d", (int)floorf(display_min));
+    cv.drawString(buf, 2, CHART_Y - 20);
+
+    int text_y = last_y - 12;
+    if (text_y < CHART_Y - CHART_H) text_y = CHART_Y - CHART_H;
+    if (text_y > CHART_Y - 20)      text_y = CHART_Y - 20;
+    cv.setTextColor(COLOR_CURRENT, COLOR_BG);
+    snprintf(buf, sizeof(buf), "%.2f", last_value);
+    cv.drawString(buf, 2, text_y);
+}
+
+// ──────────────────────────────────────────────────────────
+// 渲染整帧到后台 canvas（g_canvas[g_back]），不推送到屏幕
+// ──────────────────────────────────────────────────────────
+void pushFrame(int elapsed_ms) {
+    auto& cv = g_canvas[g_back];
+    cv.fillScreen(COLOR_BG);
+    renderStatusBar(cv, elapsed_ms);
+
+    if (g_state == STATE_CALIBRATING) {
+        renderCalibrationView(cv, elapsed_ms);
+    } else {
+        renderChartStatic(cv);
+        renderChartDynamic(cv);
     }
 
     // 每秒打印 FPS
@@ -254,6 +344,76 @@ void displayFrame(int elapsed_ms) {
     xSemaphoreTake(g_sem_push_done, portMAX_DELAY);  // 等上一帧推送完
     std::swap(g_back, g_front);                       // 交换前/后台
     xSemaphoreGive(g_sem_render_done);                // 通知 Core 0 推送
+    g_last_frame_ms = millis();
+    g_frame_dirty = false;
+}
+
+static void startCalibration() {
+    g_state = STATE_CALIBRATING;
+    g_calib_sum = 0.0;
+    g_calib_count = 0;
+    g_calib_start_ms = millis();
+    resetMeasurement();
+    markFrameDirty();
+}
+
+static void stopRecording() {
+    g_state = STATE_STOPPED;
+    g_sensor_converting = false;
+    markFrameDirty();
+    displayFrame(0);
+}
+
+static void handleTouchInput() {
+    auto touch = M5.Touch.getDetail();
+    if (!touch.wasPressed()) return;
+
+    if (g_state == STATE_IDLE || g_state == STATE_STOPPED) {
+        startCalibration();
+    } else if (g_state == STATE_RUNNING) {
+        stopRecording();
+    }
+}
+
+static void updateCalibration() {
+    if (!g_sensor_converting) {
+        startSensorConversion();
+    }
+
+    float raw = NAN;
+    if (readCompletedRawSample(&raw)) {
+        g_calib_sum += raw;
+        g_calib_count++;
+    }
+
+    uint32_t now = millis();
+    uint32_t elapsed = now - g_calib_start_ms;
+    markFrameDirty();  // 校准进度和倒计时按时间推进，需持续刷新
+
+    if (shouldRender(now, CALIB_FRAME_MS)) {
+        displayFrame((int)elapsed);
+    }
+
+    if (elapsed < CALIB_DURATION_MS) return;
+
+    g_offset = (g_calib_count > 0) ? (float)(g_calib_sum / g_calib_count) : 0.0f;
+    g_state = STATE_RUNNING;
+    g_live_hpa = 0.0f;
+    startSensorConversion();
+    markFrameDirty();
+}
+
+static void updateRunning() {
+    uint32_t now = millis();
+
+    consumeSensorSample();
+    if (!g_sensor_converting) {
+        startSensorConversion();
+    }
+
+    if (shouldRender(now, RUNNING_FRAME_MS)) {
+        displayFrame(0);
+    }
 }
 
 // ──────────────────────────────────────────────────────────
@@ -272,16 +432,26 @@ void setup() {
     for (int i = 0; i < 2; i++) {
         // 必须与 Panel_DSI 的 rgb565_nonswapped 格式一致，否则每帧逐像素字节交换极慢
         g_canvas[i].setColorDepth(lgfx::rgb565_nonswapped);
-        g_canvas[i].createSprite(SCREEN_H, SCREEN_W);  // 720 × 1280 物理
+        if (!g_canvas[i].createSprite(SCREEN_H, SCREEN_W)) {
+            Serial.println("createSprite failed");
+            for (;;) delay(1000);
+        }
         g_canvas[i].setRotation(1);                     // 逻辑 1280 × 720
         g_canvas[i].setTextSize(3);
     }
 
     g_sem_render_done = xSemaphoreCreateBinary();
     g_sem_push_done   = xSemaphoreCreateBinary();
+    if (!g_sem_render_done || !g_sem_push_done) {
+        Serial.println("semaphore create failed");
+        for (;;) delay(1000);
+    }
     xSemaphoreGive(g_sem_push_done);  // 初始状态：无推送进行中
 
-    xTaskCreatePinnedToCore(taskPush, "push", 4096, nullptr, 5, nullptr, 0);
+    if (xTaskCreatePinnedToCore(taskPush, "push", 4096, nullptr, 5, nullptr, 0) != pdPASS) {
+        Serial.println("push task create failed");
+        for (;;) delay(1000);
+    }
 
     displayFrame(0);
 }
@@ -289,72 +459,21 @@ void setup() {
 // ──────────────────────────────────────────────────────────
 void loop() {
     M5.update();
+    handleTouchInput();
 
-    // ── 触摸检测 ──
-    auto touch = M5.Touch.getDetail();
-    if (touch.wasPressed()) {
-        if (g_state == STATE_IDLE || g_state == STATE_STOPPED) {
-            g_state           = STATE_CALIBRATING;
-            g_calib_sum       = 0.0;
-            g_calib_count     = 0;
-            g_calib_start_ms  = millis();
-            g_data_count      = 0;
-            g_sensor_converting = false;
-        } else if (g_state == STATE_RUNNING) {
-            g_state = STATE_STOPPED;
-            g_sensor_converting = false;
-            displayFrame(0);
-        }
-    }
-
-    // ── 校准阶段（阻塞读取，精度优先）──
-    if (g_state == STATE_CALIBRATING) {
-        unsigned long elapsed = millis() - g_calib_start_ms;
-        float raw = readPressureHpa();
-        if (!isnan(raw)) {
-            g_calib_sum += raw;
-            g_calib_count++;
-        }
-        displayFrame((int)elapsed);
-        if (elapsed >= CALIB_DURATION_MS) {
-            g_offset    = (g_calib_count > 0) ? (float)(g_calib_sum / g_calib_count) : 0.0f;
-            g_state     = STATE_RUNNING;
-            g_live_hpa  = 0.0f;
-            // 立即触发第一次转换
-            sensorTrigger();
-            g_sensor_trigger_ms = millis();
-            g_sensor_converting = true;
-        }
-        return;
-    }
-
-    // ── 记录阶段 ──
-    if (g_state == STATE_RUNNING) {
-        unsigned long now = millis();
-
-        // 1. 读取上一帧触发的转换结果（非阻塞：只在等待够 SENSOR_CONV_MS 后读）
-        if (g_sensor_converting && now - g_sensor_trigger_ms >= SENSOR_CONV_MS) {
-            float raw = sensorReadResult();
-            g_sensor_converting = false;
-            if (!isnan(raw)) {
-                g_live_hpa = raw - g_offset;
-                if (g_data_count < MAX_POINTS) {
-                    g_data[g_data_count++] = g_live_hpa;
-                } else {
-                    memmove(g_data, g_data + 1, (MAX_POINTS - 1) * sizeof(float));
-                    g_data[MAX_POINTS - 1] = g_live_hpa;
-                }
+    switch (g_state) {
+        case STATE_CALIBRATING:
+            updateCalibration();
+            return;
+        case STATE_RUNNING:
+            updateRunning();
+            return;
+        case STATE_IDLE:
+        case STATE_STOPPED:
+        default:
+            if (g_frame_dirty) {
+                displayFrame(0);
             }
-        }
-
-        // 2. 渲染到后台 canvas，交换，通知推送（Core 0 与 Core 1 并行）
-        displayFrame(0);
-
-        // 3. 渲染完成后立即触发下一次传感器转换（下帧开头读结果）
-        if (!g_sensor_converting) {
-            sensorTrigger();
-            g_sensor_trigger_ms = millis();
-            g_sensor_converting = true;
-        }
+            return;
     }
 }
