@@ -68,9 +68,18 @@ enum AppState { STATE_IDLE, STATE_CALIBRATING, STATE_RUNNING, STATE_STOPPED };
 
 AppState      g_state          = STATE_IDLE;
 float         g_data[MAX_POINTS];
+int16_t       g_x_pos[MAX_POINTS];
 int           g_data_head      = 0;
 int           g_data_count     = 0;
+float         g_data_min       = 0.0f;
+float         g_data_max       = 0.0f;
 float         g_live_hpa       = 0.0f;
+int           g_cached_display_max = 0;
+int           g_cached_display_min = 0;
+float         g_cached_label_value = NAN;
+char          g_label_max_text[16] = "0";
+char          g_label_min_text[16] = "0";
+char          g_current_value_text[16] = "0.00";
 
 // 校准相关
 float         g_offset         = 0.0f;
@@ -115,20 +124,57 @@ static float dataAt(int logical_index) {
     return g_data[dataIndex(logical_index)];
 }
 
+static float dataLast() {
+    return g_data[dataIndex(g_data_count - 1)];
+}
+
+static void recomputeDataRange() {
+    if (g_data_count <= 0) {
+        g_data_min = 0.0f;
+        g_data_max = 0.0f;
+        return;
+    }
+
+    float cur_min = dataAt(0);
+    float cur_max = cur_min;
+    for (int i = 1; i < g_data_count; i++) {
+        float value = dataAt(i);
+        if (value < cur_min) cur_min = value;
+        if (value > cur_max) cur_max = value;
+    }
+    g_data_min = cur_min;
+    g_data_max = cur_max;
+}
+
 static void appendData(float value) {
     if (g_data_count < MAX_POINTS) {
         g_data[dataIndex(g_data_count)] = value;
         g_data_count++;
+        if (g_data_count == 1) {
+            g_data_min = value;
+            g_data_max = value;
+        } else {
+            if (value < g_data_min) g_data_min = value;
+            if (value > g_data_max) g_data_max = value;
+        }
         return;
     }
 
+    float dropped = g_data[g_data_head];
     g_data[g_data_head] = value;
     g_data_head = (g_data_head + 1) % MAX_POINTS;
+    if (value < g_data_min) g_data_min = value;
+    if (value > g_data_max) g_data_max = value;
+    if (dropped == g_data_min || dropped == g_data_max) {
+        recomputeDataRange();
+    }
 }
 
 static void resetData() {
     g_data_head = 0;
     g_data_count = 0;
+    g_data_min = 0.0f;
+    g_data_max = 0.0f;
 }
 
 static void markFrameDirty() {
@@ -143,6 +189,33 @@ static void resetMeasurement() {
     resetData();
     g_live_hpa = 0.0f;
     g_sensor_converting = false;
+    g_cached_display_max = 0;
+    g_cached_display_min = 0;
+    g_cached_label_value = NAN;
+    snprintf(g_label_max_text, sizeof(g_label_max_text), "0");
+    snprintf(g_label_min_text, sizeof(g_label_min_text), "0");
+    snprintf(g_current_value_text, sizeof(g_current_value_text), "0.00");
+}
+
+static void initChartGeometry() {
+    for (int i = 0; i < MAX_POINTS; i++) {
+        g_x_pos[i] = (int16_t)(CHART_X + i * X_STEP);
+    }
+}
+
+static void updateChartLabelTexts(int display_max_i, int display_min_i, float last_value) {
+    if (display_max_i != g_cached_display_max) {
+        g_cached_display_max = display_max_i;
+        snprintf(g_label_max_text, sizeof(g_label_max_text), "%d", display_max_i);
+    }
+    if (display_min_i != g_cached_display_min) {
+        g_cached_display_min = display_min_i;
+        snprintf(g_label_min_text, sizeof(g_label_min_text), "%d", display_min_i);
+    }
+    if (isnan(g_cached_label_value) || g_cached_label_value != last_value) {
+        g_cached_label_value = last_value;
+        snprintf(g_current_value_text, sizeof(g_current_value_text), "%.2f", last_value);
+    }
 }
 
 // ──────────────────────────────────────────────────────────
@@ -224,9 +297,7 @@ static void renderStatusBar(M5Canvas& cv, int elapsed_ms) {
     } else if (g_state == STATE_STOPPED) {
         cv.drawString("Stopped. Tap anywhere to Start", 10, 20);
     } else if (g_state == STATE_RUNNING) {
-        char buf[64];
-        snprintf(buf, sizeof(buf), "Recording...  %.2f hPa", g_live_hpa);
-        cv.drawString(buf, 10, 20);
+        cv.drawString("Recording...", 10, 20);
     } else if (g_state == STATE_CALIBRATING) {
         int secs_left = (int)((CALIB_DURATION_MS - elapsed_ms + 999) / 1000);
         if (secs_left < 0) secs_left = 0;
@@ -260,54 +331,82 @@ static void renderChartDynamic(M5Canvas& cv) {
     // ── 折线图（仅 RUNNING 且有数据时）──
     if (g_state != STATE_RUNNING || g_data_count < 1) return;
 
-    float cur_min = dataAt(0), cur_max = dataAt(0);
-    for (int i = 1; i < g_data_count; i++) {
-        float value = dataAt(i);
-        if (value < cur_min) cur_min = value;
-        if (value > cur_max) cur_max = value;
-    }
-
-    float display_min = (cur_min > 0.0f) ? 0.0f : cur_min;
-    float y_range     = cur_max - display_min;
+    float display_min = (g_data_min > 0.0f) ? 0.0f : g_data_min;
+    float y_range     = g_data_max - display_min;
     if (y_range < 100.0f) y_range = 100.0f;
     float display_max = ceilf(display_min + y_range);
     y_range = display_max - display_min;
+    float y_scale = (float)CHART_H / y_range;
 
     if (display_min < 0.0f) {
-        int y_zero = (int)(CHART_Y - (0.0f - display_min) / y_range * CHART_H);
+        int y_zero = (int)(CHART_Y - (0.0f - display_min) * y_scale);
         cv.drawLine(CHART_X, y_zero, CHART_X + CHART_W, y_zero, COLOR_ZERO);
         cv.setTextSize(2);
         cv.setTextColor(COLOR_AXIS, COLOR_BG);
         cv.drawString("0", 2, y_zero - 12);
     }
 
-    for (int i = 0; i < g_data_count - 1; i++) {
-        int x1 = (int)(CHART_X + i * X_STEP);
-        int y1 = (int)(CHART_Y - ((dataAt(i)     - display_min) / y_range) * CHART_H);
-        int x2 = (int)(CHART_X + (i + 1) * X_STEP);
-        int y2 = (int)(CHART_Y - ((dataAt(i + 1) - display_min) / y_range) * CHART_H);
-        cv.drawLine(x1, y1, x2, y2, COLOR_LINE);
+    float last_value = dataLast();
+    int last_y = (int)(CHART_Y - ((last_value - display_min) * y_scale));
+    int last_x = g_x_pos[g_data_count - 1];
+
+    if (g_data_count > 1) {
+        int idx = g_data_head;
+        float prev_value = g_data[idx];
+        int prev_y = (int)(CHART_Y - ((prev_value - display_min) * y_scale));
+
+        for (int i = 0; i < g_data_count - 2; i++) {
+            idx++;
+            if (idx == MAX_POINTS) idx = 0;
+            float next_value = g_data[idx];
+            int next_y = (int)(CHART_Y - ((next_value - display_min) * y_scale));
+            cv.drawLine(g_x_pos[i], prev_y, g_x_pos[i + 1], next_y, COLOR_LINE);
+            prev_y = next_y;
+        }
+
+        cv.drawLine(g_x_pos[g_data_count - 2], prev_y, last_x, last_y, COLOR_LINE);
     }
 
-    int last_x = (int)(CHART_X + (g_data_count - 1) * X_STEP);
-    float last_value = dataAt(g_data_count - 1);
-    int last_y = (int)(CHART_Y - ((last_value - display_min) / y_range) * CHART_H);
     cv.fillRect(last_x - 3, last_y - 3, 7, 7, COLOR_CURRENT);
 
-    cv.setTextSize(2);
-    char buf[16];
-    cv.setTextColor(COLOR_AXIS, COLOR_BG);
-    snprintf(buf, sizeof(buf), "%d", (int)display_max);
-    cv.drawString(buf, 2, CHART_Y - CHART_H);
-    snprintf(buf, sizeof(buf), "%d", (int)floorf(display_min));
-    cv.drawString(buf, 2, CHART_Y - 20);
+    int display_max_i = (int)display_max;
+    int display_min_i = (int)floorf(display_min);
+    updateChartLabelTexts(display_max_i, display_min_i, last_value);
 
-    int text_y = last_y - 12;
-    if (text_y < CHART_Y - CHART_H) text_y = CHART_Y - CHART_H;
-    if (text_y > CHART_Y - 20)      text_y = CHART_Y - 20;
+    cv.setTextSize(2);
+    cv.setTextColor(COLOR_AXIS, COLOR_BG);
+    cv.drawString(g_label_max_text, 2, CHART_Y - CHART_H);
+    cv.drawString(g_label_min_text, 2, CHART_Y - 20);
+
+    const int bubble_pad_x = 14;
+    const int bubble_pad_y = 10;
+    const int bubble_gap = 14;
+    cv.setTextSize(3);
+    int text_w = cv.textWidth(g_current_value_text);
+    int text_h = 24;
+    int bubble_w = text_w + bubble_pad_x * 2;
+    int bubble_h = text_h + bubble_pad_y * 2;
+
+    int bubble_x = last_x + bubble_gap;
+    if (bubble_x + bubble_w > CHART_X + CHART_W) {
+        bubble_x = last_x - bubble_gap - bubble_w;
+    }
+    if (bubble_x < CHART_X + 4) {
+        bubble_x = CHART_X + 4;
+    }
+
+    int bubble_y = last_y - bubble_h / 2;
+    if (bubble_y < CHART_Y - CHART_H + 4) {
+        bubble_y = CHART_Y - CHART_H + 4;
+    }
+    if (bubble_y + bubble_h > CHART_Y - 4) {
+        bubble_y = CHART_Y - 4 - bubble_h;
+    }
+
+    cv.drawRoundRect(bubble_x, bubble_y, bubble_w, bubble_h, 8, COLOR_CURRENT);
+    cv.fillRoundRect(bubble_x + 1, bubble_y + 1, bubble_w - 2, bubble_h - 2, 8, COLOR_BG);
     cv.setTextColor(COLOR_CURRENT, COLOR_BG);
-    snprintf(buf, sizeof(buf), "%.2f", last_value);
-    cv.drawString(buf, 2, text_y);
+    cv.drawString(g_current_value_text, bubble_x + bubble_pad_x, bubble_y + bubble_pad_y);
 }
 
 // ──────────────────────────────────────────────────────────
@@ -424,6 +523,7 @@ void setup() {
 
     Wire.begin(I2C_SDA, I2C_SCL, I2C_FREQ);
     M5.Display.fillScreen(COLOR_BG);
+    initChartGeometry();
 
     // 两个 canvas：物理 720×1280，逻辑旋转为 1280×720 横屏
     // Display 保持 r=0，pushSprite 走 memcpy 快速路径
