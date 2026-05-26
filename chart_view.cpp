@@ -5,9 +5,9 @@
 
 namespace {
 
-constexpr float X_STEP = (float)CHART_W / (MAX_POINTS - 1);
+constexpr float X_STEP = (float)CHART_W / (CHART_VISIBLE_POINTS - 1);
 
-int16_t s_x_pos[MAX_POINTS];
+int16_t s_x_pos[CHART_VISIBLE_POINTS];
 int     s_cached_display_max = 0;
 int     s_cached_display_min = 0;
 float   s_cached_label_value = NAN;
@@ -34,7 +34,7 @@ void updateChartLabelTexts(int display_max_i, int display_min_i, float last_valu
 } // namespace
 
 void ChartView::initGeometry() {
-    for (int i = 0; i < MAX_POINTS; i++) {
+    for (int i = 0; i < CHART_VISIBLE_POINTS; i++) {
         s_x_pos[i] = (int16_t)(CHART_X + i * X_STEP);
     }
 }
@@ -57,6 +57,9 @@ void ChartView::renderStatusBar(M5Canvas& cv, AppState state, int elapsed_ms) {
         cv.drawString("Stopped. Tap anywhere to Start", 10, 20);
     } else if (state == STATE_RUNNING) {
         cv.drawString("Recording...", 10, 20);
+    } else if (state == STATE_PAUSED) {
+        cv.setTextColor(COLOR_PAUSED, COLOR_BG);
+        cv.drawString("Paused. Swipe history", 10, 20);
     } else if (state == STATE_CALIBRATING) {
         int secs_left = (int)((CALIB_DURATION_MS - elapsed_ms + 999) / 1000);
         if (secs_left < 0) secs_left = 0;
@@ -85,12 +88,29 @@ void ChartView::renderChartStatic(M5Canvas& cv) {
     cv.drawLine(CHART_X, CHART_Y, CHART_X + CHART_W, CHART_Y, COLOR_AXIS);
 }
 
-void ChartView::renderChartDynamic(M5Canvas& cv, const ChartData& data) {
-    const int n = data.count();
+void ChartView::renderChartDynamic(M5Canvas& cv, const ChartData& data, int view_start) {
+    const int total = data.count();
+    if (total < 1) return;
+
+    int max_start = total - CHART_VISIBLE_POINTS;
+    if (max_start < 0) max_start = 0;
+    if (view_start < 0) view_start = max_start;
+    if (view_start > max_start) view_start = max_start;
+
+    int n = total - view_start;
+    if (n > CHART_VISIBLE_POINTS) n = CHART_VISIBLE_POINTS;
     if (n < 1) return;
 
-    float display_min = (data.min() > 0.0f) ? 0.0f : data.min();
-    float y_range = data.max() - display_min;
+    float window_min = data.at(view_start);
+    float window_max = window_min;
+    for (int i = 1; i < n; i++) {
+        float value = data.at(view_start + i);
+        if (value < window_min) window_min = value;
+        if (value > window_max) window_max = value;
+    }
+
+    float display_min = (window_min > 0.0f) ? 0.0f : window_min;
+    float y_range = window_max - display_min;
     if (y_range < 100.0f) y_range = 100.0f;
     float display_max = ceilf(display_min + y_range);
     y_range = display_max - display_min;
@@ -104,21 +124,17 @@ void ChartView::renderChartDynamic(M5Canvas& cv, const ChartData& data) {
         cv.drawString("0", 2, y_zero - 12);
     }
 
-    const float* buf = data.buffer();
-    int idx = data.head();
-    float prev_value = buf[idx];
+    float prev_value = data.at(view_start);
     int prev_y = (int)(CHART_Y - ((prev_value - display_min) * y_scale));
 
     for (int i = 0; i < n - 1; i++) {
-        idx++;
-        if (idx == MAX_POINTS) idx = 0;
-        float next_value = buf[idx];
+        float next_value = data.at(view_start + i + 1);
         int next_y = (int)(CHART_Y - ((next_value - display_min) * y_scale));
         cv.drawLine(s_x_pos[i], prev_y, s_x_pos[i + 1], next_y, COLOR_LINE);
         prev_y = next_y;
     }
 
-    float last_value = data.last();
+    float last_value = data.at(view_start + n - 1);
     int last_x = s_x_pos[n - 1];
     int last_y = prev_y;
 
@@ -156,4 +172,15 @@ void ChartView::renderChartDynamic(M5Canvas& cv, const ChartData& data) {
     cv.fillRoundRect(bubble_x + 1, bubble_y + 1, bubble_w - 2, bubble_h - 2, 8, COLOR_BG);
     cv.setTextColor(COLOR_CURRENT, COLOR_BG);
     cv.drawString(s_current_value_text, bubble_x + bubble_pad_x, bubble_y + bubble_pad_y);
+}
+
+void ChartView::renderResumeButton(M5Canvas& cv) {
+    cv.fillRoundRect(RESUME_BTN_X, RESUME_BTN_Y, RESUME_BTN_W, RESUME_BTN_H, 8, COLOR_BUTTON);
+    cv.drawRoundRect(RESUME_BTN_X, RESUME_BTN_Y, RESUME_BTN_W, RESUME_BTN_H, 8, COLOR_AXIS);
+    cv.setTextSize(3);
+    cv.setTextColor(COLOR_AXIS, COLOR_BUTTON);
+    const char* label = "Resume";
+    int text_x = RESUME_BTN_X + (RESUME_BTN_W - cv.textWidth(label)) / 2;
+    int text_y = RESUME_BTN_Y + 16;
+    cv.drawString(label, text_x, text_y);
 }

@@ -39,6 +39,11 @@ uint32_t      g_frame_count    = 0;
 unsigned long g_fps_last_ms    = 0;
 unsigned long g_last_frame_ms  = 0;
 bool          g_frame_dirty    = true;
+int           g_view_start     = 0;
+
+int           g_touch_start_x  = 0;
+int           g_drag_start_view = 0;
+bool          g_touch_on_resume = false;
 
 // ── 双 Canvas ping-pong（PSRAM 分配 1.84MB × 2）──────────
 M5Canvas g_canvas[2] = { M5Canvas(&M5.Display), M5Canvas(&M5.Display) };
@@ -64,6 +69,41 @@ static bool shouldRender(uint32_t now_ms, uint32_t interval_ms) {
     return g_frame_dirty && now_ms - g_last_frame_ms >= interval_ms;
 }
 
+static int latestViewStart() {
+    int start = g_data.count() - CHART_VISIBLE_POINTS;
+    return (start > 0) ? start : 0;
+}
+
+static int clampViewStart(int start) {
+    int max_start = latestViewStart();
+    if (start < 0) return 0;
+    if (start > max_start) return max_start;
+    return start;
+}
+
+static bool isInsideResumeButton(int x, int y) {
+    return x >= RESUME_BTN_X && x < RESUME_BTN_X + RESUME_BTN_W &&
+           y >= RESUME_BTN_Y && y < RESUME_BTN_Y + RESUME_BTN_H;
+}
+
+// Display 保持物理竖屏 r=0；Canvas 以 r=1 横屏绘制，因此触点需转为 1280×720 逻辑坐标。
+static void mapTouchToScreen(const m5::touch_detail_t& touch, int* x, int* y) {
+    int sx = touch.y;
+    int sy = SCREEN_H - 1 - touch.x;
+    if (sx < 0) sx = 0;
+    if (sx >= SCREEN_W) sx = SCREEN_W - 1;
+    if (sy < 0) sy = 0;
+    if (sy >= SCREEN_H) sy = SCREEN_H - 1;
+    *x = sx;
+    *y = sy;
+}
+
+static int pointsFromDrag(int dx) {
+    const float pixels_per_point = (float)CHART_W / (CHART_VISIBLE_POINTS - 1);
+    if (dx >= 0) return (int)(dx / pixels_per_point + 0.5f);
+    return (int)(dx / pixels_per_point - 0.5f);
+}
+
 static void renderToBack(int elapsed_ms) {
     auto& cv = g_canvas[g_back];
     cv.fillScreen(COLOR_BG);
@@ -73,8 +113,12 @@ static void renderToBack(int elapsed_ms) {
         ChartView::renderCalibrationView(cv, elapsed_ms);
     } else {
         ChartView::renderChartStatic(cv);
-        if (g_state == STATE_RUNNING) {
-            ChartView::renderChartDynamic(cv, g_data);
+        if (g_state == STATE_RUNNING || g_state == STATE_PAUSED) {
+            int view_start = (g_state == STATE_RUNNING) ? -1 : g_view_start;
+            ChartView::renderChartDynamic(cv, g_data, view_start);
+        }
+        if (g_state == STATE_PAUSED) {
+            ChartView::renderResumeButton(cv);
         }
     }
 
@@ -120,6 +164,7 @@ static bool consumeSensorSample(float* raw_out) {
 static void resetMeasurement() {
     g_data.reset();
     g_live_hpa = 0.0f;
+    g_view_start = 0;
     PressureSensor::cancel();
     ChartView::resetTextCache();
 }
@@ -133,21 +178,62 @@ static void startCalibration() {
     markFrameDirty();
 }
 
-static void stopRecording() {
-    g_state = STATE_STOPPED;
+static void pauseRecording() {
+    g_state = STATE_PAUSED;
+    g_view_start = latestViewStart();
     PressureSensor::cancel();
     markFrameDirty();
-    displayFrame(0);
+}
+
+static void resumeRecording() {
+    g_state = STATE_RUNNING;
+    g_view_start = latestViewStart();
+    PressureSensor::startConversion();
+    markFrameDirty();
+}
+
+static void handlePausedTouch(const m5::touch_detail_t& touch) {
+    int x = 0;
+    int y = 0;
+    mapTouchToScreen(touch, &x, &y);
+
+    if (touch.wasPressed()) {
+        g_touch_start_x = x;
+        g_drag_start_view = g_view_start;
+        g_touch_on_resume = isInsideResumeButton(x, y);
+        return;
+    }
+
+    if (touch.isPressed() && !g_touch_on_resume) {
+        int next_start = clampViewStart(g_drag_start_view - pointsFromDrag(x - g_touch_start_x));
+        if (next_start != g_view_start) {
+            g_view_start = next_start;
+            markFrameDirty();
+        }
+        return;
+    }
+
+    if (touch.wasReleased()) {
+        if (g_touch_on_resume && isInsideResumeButton(x, y)) {
+            resumeRecording();
+        }
+        g_touch_on_resume = false;
+    }
 }
 
 static void handleTouchInput() {
     auto touch = M5.Touch.getDetail();
+    if (g_state == STATE_PAUSED) {
+        handlePausedTouch(touch);
+        return;
+    }
+
     if (!touch.wasPressed()) return;
 
     if (g_state == STATE_IDLE || g_state == STATE_STOPPED) {
         startCalibration();
     } else if (g_state == STATE_RUNNING) {
-        stopRecording();
+        pauseRecording();
     }
 }
 
@@ -174,6 +260,7 @@ static void updateCalibration() {
     g_offset = (g_calib_count > 0) ? (float)(g_calib_sum / g_calib_count) : 0.0f;
     g_state = STATE_RUNNING;
     g_live_hpa = 0.0f;
+    g_view_start = 0;
     PressureSensor::startConversion();
     markFrameDirty();
 }
@@ -185,6 +272,7 @@ static void updateRunning() {
     if (consumeSensorSample(&raw)) {
         g_live_hpa = raw - g_offset;
         g_data.append(g_live_hpa);
+        g_view_start = latestViewStart();
         markFrameDirty();
     }
     ensureSensorRunning();
@@ -244,6 +332,9 @@ void loop() {
             return;
         case STATE_RUNNING:
             updateRunning();
+            return;
+        case STATE_PAUSED:
+            if (g_frame_dirty) displayFrame(0);
             return;
         case STATE_IDLE:
         case STATE_STOPPED:

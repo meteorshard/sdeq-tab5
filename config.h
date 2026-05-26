@@ -19,7 +19,13 @@
 #define CHART_Y      690
 #define CHART_W      1160
 #define CHART_H      590
-#define MAX_POINTS   200
+#define CHART_VISIBLE_POINTS 200
+#define MAX_POINTS   10000  // 约 5 分钟历史（按 32ms/点估算）
+
+#define RESUME_BTN_W 180
+#define RESUME_BTN_H 56
+#define RESUME_BTN_X (SCREEN_W - RESUME_BTN_W - 24)
+#define RESUME_BTN_Y (SCREEN_H - RESUME_BTN_H - 24)
 
 // ── 颜色 ───────────────────────────────────────────────────
 #define COLOR_BG      0x000000UL
@@ -28,6 +34,8 @@
 #define COLOR_ZERO    0x888888UL
 #define COLOR_CURRENT 0xFFFF00UL
 #define COLOR_CALIB   0x00BFFFUL
+#define COLOR_PAUSED  0xFFA000UL
+#define COLOR_BUTTON  0x1E88E5UL
 
 // ── 时序 ───────────────────────────────────────────────────
 #define SENSOR_CONV_MS    32
